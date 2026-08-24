@@ -4,96 +4,501 @@ on:
   push:
     paths:
       - "**.spec"
+      - "build-order.txt"
+      - "ci/**"
+      - ".forgejo/workflows/build-rpms.yml"
+  pull_request:
   workflow_dispatch:
 
+env:
+  FORGEJO_URL: ${{ github.server_url }}
+  FORGEJO_OWNER: ${{ github.repository_owner }}
+  FORGEJO_TOKEN: ${{ secrets.PACKAGE_TOKEN }}
+
 jobs:
-  build:
+  parse:
     runs-on: almalinux-10
     strategy:
       fail-fast: false
       matrix:
-        spec:
-          - sonic-interface-libraries.spec
-          - sonic-win.spec
-          - sonic-workspace.spec
+        image:
+          - almalinux:10
+          - fedora:latest
+    container:
+      image: ${{ matrix.image }}
+    steps:
+      - name: Install build tools
+        run: dnf install -y rpm-build rpmdevtools git-core
 
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install the SonicDE RPM macros
+        run: ci/install-macros.sh
+
+      - name: Parse every spec
+        run: ci/parse-specs.sh
+
+  tier1:
+    runs-on: almalinux-10
+    needs: [parse]
+    strategy:
+      fail-fast: false
+      matrix:
+        chroot:
+          - alma+epel-10-x86_64
+          - fedora-43-x86_64
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Install build tools
-        run: |
-          dnf install -y \
-            rpm-build \
-            rpmdevtools \
-            mock \
-            curl
+        run: dnf install -y rpm-build rpmdevtools mock curl
 
       - name: Add runner user to mock group
         run: usermod -aG mock $(whoami) || true
 
-      - name: Setup RPM build tree
-        run: rpmdev-setuptree
+      - name: Install the SonicDE RPM macros
+        run: ci/install-macros.sh
 
-      - name: Download sources for ${{ matrix.spec }}
-        run: |
-          spectool -g -C ~/rpmbuild/SOURCES/ ${{ matrix.spec }}
-
-      - name: Build SRPM from ${{ matrix.spec }}
-        run: |
-          rpmbuild -bs \
-            --define "_topdir ${HOME}/rpmbuild" \
-            --define "_disable_source_fetch 0" \
-            ${{ matrix.spec }}
-          PKGNAME=$(rpmspec -q --srpm --queryformat "%{NAME}-%{VERSION}-%{RELEASE}.src.rpm" ${{ matrix.spec }})
-          echo "SRPM_PATH=${HOME}/rpmbuild/SRPMS/${PKGNAME}" >> "$GITHUB_ENV"
-
-      - name: Build RPM with mock
-        run: |
-          cat > /etc/mock/custom.cfg <<'MOCKEOF'
-          include('/etc/mock/alma+epel-10-x86_64.cfg')
-          config_opts['root'] = 'custom'
-          config_opts['yum.conf'] += """
-          [sonicde-rpm]
-          name=SonicDE RPM
-          baseurl=https://pc-rytteren.dk/forge/api/packages/anders/rpm
-          enabled=1
-          gpgcheck=0
-
-          [xlibre-xserver]
-          name=Copr xlibre-xserver
-          baseurl=https://download.copr.fedorainfracloud.org/results/@xlibre/xlibre-xserver/rhel+epel-10-$basearch/
-          type=rpm-md
-          skip_if_unavailable=True
-          gpgcheck=1
-          gpgkey=https://download.copr.fedorainfracloud.org/results/@xlibre/xlibre-xserver/pubkey.gpg
-          repo_gpgcheck=0
-          enabled=1
-          """
-          MOCKEOF
-
-          mock --root custom --scrub=all || true
-          mock --root custom --init
-          mock --root custom --chroot 'groupadd -g 135 mock 2>/dev/null || true; useradd -u 135 -g 135 -d /builddir -s /bin/bash mockbuild 2>/dev/null || true'
-          mock --root custom --resultdir "${HOME}/mock-results" --no-clean --rebuild "${{ env.SRPM_PATH }}"
-
-      - name: Upload RPMs to Forgejo Package Registry
-        run: |
-          FORGEJO_URL="${{ github.server_url }}"
-          OWNER="${{ github.repository_owner }}"
-          TOKEN="${{ secrets.PACKAGE_TOKEN }}"
-
-          find "${HOME}/mock-results" -name "*.rpm" ! -name "*.src.rpm" | while read rpm; do
-            FILENAME=$(basename "$rpm")
-            echo "Uploading $FILENAME ..."
-            curl --fail-with-body \
-              --user "${OWNER}:${TOKEN}" \
-              --upload-file "$rpm" \
-              "${FORGEJO_URL}/api/packages/${OWNER}/rpm/upload"
-          done
+      - name: Build tier1 for ${{ matrix.chroot }}
+        run: ci/build-tier.sh tier1 ${{ matrix.chroot }}
 
       - name: Clean up build artifacts
         if: always()
-        run: |
-          rm -rf "${HOME}/mock-results"
-          rm -rf "${HOME}/rpmbuild/SRPMS"
+        run: rm -rf "${HOME}/mock-results" "${HOME}/rpmbuild/SRPMS"
+
+  tier2:
+    runs-on: almalinux-10
+    needs: [tier1]
+    strategy:
+      fail-fast: false
+      matrix:
+        chroot:
+          - alma+epel-10-x86_64
+          - fedora-43-x86_64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: dnf install -y rpm-build rpmdevtools mock curl
+
+      - name: Add runner user to mock group
+        run: usermod -aG mock $(whoami) || true
+
+      - name: Install the SonicDE RPM macros
+        run: ci/install-macros.sh
+
+      - name: Build tier2 for ${{ matrix.chroot }}
+        run: ci/build-tier.sh tier2 ${{ matrix.chroot }}
+
+      - name: Clean up build artifacts
+        if: always()
+        run: rm -rf "${HOME}/mock-results" "${HOME}/rpmbuild/SRPMS"
+
+  tier3:
+    runs-on: almalinux-10
+    needs: [tier2]
+    strategy:
+      fail-fast: false
+      matrix:
+        chroot:
+          - alma+epel-10-x86_64
+          - fedora-43-x86_64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: dnf install -y rpm-build rpmdevtools mock curl
+
+      - name: Add runner user to mock group
+        run: usermod -aG mock $(whoami) || true
+
+      - name: Install the SonicDE RPM macros
+        run: ci/install-macros.sh
+
+      - name: Build tier3 for ${{ matrix.chroot }}
+        run: ci/build-tier.sh tier3 ${{ matrix.chroot }}
+
+      - name: Clean up build artifacts
+        if: always()
+        run: rm -rf "${HOME}/mock-results" "${HOME}/rpmbuild/SRPMS"
+
+  tier4:
+    runs-on: almalinux-10
+    needs: [tier3]
+    strategy:
+      fail-fast: false
+      matrix:
+        chroot:
+          - alma+epel-10-x86_64
+          - fedora-43-x86_64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: dnf install -y rpm-build rpmdevtools mock curl
+
+      - name: Add runner user to mock group
+        run: usermod -aG mock $(whoami) || true
+
+      - name: Install the SonicDE RPM macros
+        run: ci/install-macros.sh
+
+      - name: Build tier4 for ${{ matrix.chroot }}
+        run: ci/build-tier.sh tier4 ${{ matrix.chroot }}
+
+      - name: Clean up build artifacts
+        if: always()
+        run: rm -rf "${HOME}/mock-results" "${HOME}/rpmbuild/SRPMS"
+
+  tier5:
+    runs-on: almalinux-10
+    needs: [tier4]
+    strategy:
+      fail-fast: false
+      matrix:
+        chroot:
+          - alma+epel-10-x86_64
+          - fedora-43-x86_64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: dnf install -y rpm-build rpmdevtools mock curl
+
+      - name: Add runner user to mock group
+        run: usermod -aG mock $(whoami) || true
+
+      - name: Install the SonicDE RPM macros
+        run: ci/install-macros.sh
+
+      - name: Build tier5 for ${{ matrix.chroot }}
+        run: ci/build-tier.sh tier5 ${{ matrix.chroot }}
+
+      - name: Clean up build artifacts
+        if: always()
+        run: rm -rf "${HOME}/mock-results" "${HOME}/rpmbuild/SRPMS"
+
+  tier6:
+    runs-on: almalinux-10
+    needs: [tier5]
+    strategy:
+      fail-fast: false
+      matrix:
+        chroot:
+          - alma+epel-10-x86_64
+          - fedora-43-x86_64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: dnf install -y rpm-build rpmdevtools mock curl
+
+      - name: Add runner user to mock group
+        run: usermod -aG mock $(whoami) || true
+
+      - name: Install the SonicDE RPM macros
+        run: ci/install-macros.sh
+
+      - name: Build tier6 for ${{ matrix.chroot }}
+        run: ci/build-tier.sh tier6 ${{ matrix.chroot }}
+
+      - name: Clean up build artifacts
+        if: always()
+        run: rm -rf "${HOME}/mock-results" "${HOME}/rpmbuild/SRPMS"
+
+  tier7:
+    runs-on: almalinux-10
+    needs: [tier6]
+    strategy:
+      fail-fast: false
+      matrix:
+        chroot:
+          - alma+epel-10-x86_64
+          - fedora-43-x86_64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: dnf install -y rpm-build rpmdevtools mock curl
+
+      - name: Add runner user to mock group
+        run: usermod -aG mock $(whoami) || true
+
+      - name: Install the SonicDE RPM macros
+        run: ci/install-macros.sh
+
+      - name: Build tier7 for ${{ matrix.chroot }}
+        run: ci/build-tier.sh tier7 ${{ matrix.chroot }}
+
+      - name: Clean up build artifacts
+        if: always()
+        run: rm -rf "${HOME}/mock-results" "${HOME}/rpmbuild/SRPMS"
+
+  tier8:
+    runs-on: almalinux-10
+    needs: [tier7]
+    strategy:
+      fail-fast: false
+      matrix:
+        chroot:
+          - alma+epel-10-x86_64
+          - fedora-43-x86_64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: dnf install -y rpm-build rpmdevtools mock curl
+
+      - name: Add runner user to mock group
+        run: usermod -aG mock $(whoami) || true
+
+      - name: Install the SonicDE RPM macros
+        run: ci/install-macros.sh
+
+      - name: Build tier8 for ${{ matrix.chroot }}
+        run: ci/build-tier.sh tier8 ${{ matrix.chroot }}
+
+      - name: Clean up build artifacts
+        if: always()
+        run: rm -rf "${HOME}/mock-results" "${HOME}/rpmbuild/SRPMS"
+
+  tier9:
+    runs-on: almalinux-10
+    needs: [tier8]
+    strategy:
+      fail-fast: false
+      matrix:
+        chroot:
+          - alma+epel-10-x86_64
+          - fedora-43-x86_64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: dnf install -y rpm-build rpmdevtools mock curl
+
+      - name: Add runner user to mock group
+        run: usermod -aG mock $(whoami) || true
+
+      - name: Install the SonicDE RPM macros
+        run: ci/install-macros.sh
+
+      - name: Build tier9 for ${{ matrix.chroot }}
+        run: ci/build-tier.sh tier9 ${{ matrix.chroot }}
+
+      - name: Clean up build artifacts
+        if: always()
+        run: rm -rf "${HOME}/mock-results" "${HOME}/rpmbuild/SRPMS"
+
+  tier10:
+    runs-on: almalinux-10
+    needs: [tier9]
+    strategy:
+      fail-fast: false
+      matrix:
+        chroot:
+          - alma+epel-10-x86_64
+          - fedora-43-x86_64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: dnf install -y rpm-build rpmdevtools mock curl
+
+      - name: Add runner user to mock group
+        run: usermod -aG mock $(whoami) || true
+
+      - name: Install the SonicDE RPM macros
+        run: ci/install-macros.sh
+
+      - name: Build tier10 for ${{ matrix.chroot }}
+        run: ci/build-tier.sh tier10 ${{ matrix.chroot }}
+
+      - name: Clean up build artifacts
+        if: always()
+        run: rm -rf "${HOME}/mock-results" "${HOME}/rpmbuild/SRPMS"
+
+  tier11:
+    runs-on: almalinux-10
+    needs: [tier10]
+    strategy:
+      fail-fast: false
+      matrix:
+        chroot:
+          - alma+epel-10-x86_64
+          - fedora-43-x86_64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: dnf install -y rpm-build rpmdevtools mock curl
+
+      - name: Add runner user to mock group
+        run: usermod -aG mock $(whoami) || true
+
+      - name: Install the SonicDE RPM macros
+        run: ci/install-macros.sh
+
+      - name: Build tier11 for ${{ matrix.chroot }}
+        run: ci/build-tier.sh tier11 ${{ matrix.chroot }}
+
+      - name: Clean up build artifacts
+        if: always()
+        run: rm -rf "${HOME}/mock-results" "${HOME}/rpmbuild/SRPMS"
+
+  tier12:
+    runs-on: almalinux-10
+    needs: [tier11]
+    strategy:
+      fail-fast: false
+      matrix:
+        chroot:
+          - alma+epel-10-x86_64
+          - fedora-43-x86_64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: dnf install -y rpm-build rpmdevtools mock curl
+
+      - name: Add runner user to mock group
+        run: usermod -aG mock $(whoami) || true
+
+      - name: Install the SonicDE RPM macros
+        run: ci/install-macros.sh
+
+      - name: Build tier12 for ${{ matrix.chroot }}
+        run: ci/build-tier.sh tier12 ${{ matrix.chroot }}
+
+      - name: Clean up build artifacts
+        if: always()
+        run: rm -rf "${HOME}/mock-results" "${HOME}/rpmbuild/SRPMS"
+
+  tier13:
+    runs-on: almalinux-10
+    needs: [tier12]
+    strategy:
+      fail-fast: false
+      matrix:
+        chroot:
+          - alma+epel-10-x86_64
+          - fedora-43-x86_64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: dnf install -y rpm-build rpmdevtools mock curl
+
+      - name: Add runner user to mock group
+        run: usermod -aG mock $(whoami) || true
+
+      - name: Install the SonicDE RPM macros
+        run: ci/install-macros.sh
+
+      - name: Build tier13 for ${{ matrix.chroot }}
+        run: ci/build-tier.sh tier13 ${{ matrix.chroot }}
+
+      - name: Clean up build artifacts
+        if: always()
+        run: rm -rf "${HOME}/mock-results" "${HOME}/rpmbuild/SRPMS"
+
+  tier14:
+    runs-on: almalinux-10
+    needs: [tier13]
+    strategy:
+      fail-fast: false
+      matrix:
+        chroot:
+          - alma+epel-10-x86_64
+          - fedora-43-x86_64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: dnf install -y rpm-build rpmdevtools mock curl
+
+      - name: Add runner user to mock group
+        run: usermod -aG mock $(whoami) || true
+
+      - name: Install the SonicDE RPM macros
+        run: ci/install-macros.sh
+
+      - name: Build tier14 for ${{ matrix.chroot }}
+        run: ci/build-tier.sh tier14 ${{ matrix.chroot }}
+
+      - name: Clean up build artifacts
+        if: always()
+        run: rm -rf "${HOME}/mock-results" "${HOME}/rpmbuild/SRPMS"
+
+  tier15:
+    runs-on: almalinux-10
+    needs: [tier14]
+    strategy:
+      fail-fast: false
+      matrix:
+        chroot:
+          - alma+epel-10-x86_64
+          - fedora-43-x86_64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: dnf install -y rpm-build rpmdevtools mock curl
+
+      - name: Add runner user to mock group
+        run: usermod -aG mock $(whoami) || true
+
+      - name: Install the SonicDE RPM macros
+        run: ci/install-macros.sh
+
+      - name: Build tier15 for ${{ matrix.chroot }}
+        run: ci/build-tier.sh tier15 ${{ matrix.chroot }}
+
+      - name: Clean up build artifacts
+        if: always()
+        run: rm -rf "${HOME}/mock-results" "${HOME}/rpmbuild/SRPMS"
+
+  tier16:
+    runs-on: almalinux-10
+    needs: [tier15]
+    strategy:
+      fail-fast: false
+      matrix:
+        chroot:
+          - alma+epel-10-x86_64
+          - fedora-43-x86_64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: dnf install -y rpm-build rpmdevtools mock curl
+
+      - name: Add runner user to mock group
+        run: usermod -aG mock $(whoami) || true
+
+      - name: Install the SonicDE RPM macros
+        run: ci/install-macros.sh
+
+      - name: Build tier16 for ${{ matrix.chroot }}
+        run: ci/build-tier.sh tier16 ${{ matrix.chroot }}
+
+      - name: Clean up build artifacts
+        if: always()
+        run: rm -rf "${HOME}/mock-results" "${HOME}/rpmbuild/SRPMS"
